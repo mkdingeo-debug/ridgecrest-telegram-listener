@@ -126,6 +126,8 @@ def enviar_mensaje(chat_id, texto: str, parse_mode: Optional[str] = None) -> Non
         result = resp.json()
         if not result.get("ok"):
             print(f"[Error enviando mensaje a {chat_id}] {result}")
+        else:
+            print(f"[Mensaje enviado OK] a chat_id={chat_id}")
     except Exception as exc:
         print(f"[Error enviando mensaje a {chat_id}] {type(exc).__name__}: {exc}")
 
@@ -148,6 +150,8 @@ def responder_estado(username: Optional[str], chat_id_respuesta) -> None:
         print(f"[Error] No se pudo consultar Supabase para /estado: {exc}")
         enviar_mensaje(chat_id_respuesta, "Hubo un problema consultando tu suscripción. Probá de nuevo en un rato.")
         return
+
+    print(f"[Comando /estado] Cliente encontrado para @{username}: {cliente.get('nombre') if cliente else 'NINGUNO'}")
 
     if not cliente:
         enviar_mensaje(
@@ -192,15 +196,21 @@ def responder_estado(username: Optional[str], chat_id_respuesta) -> None:
 
 def procesar_mensaje(mensaje: dict) -> None:
     chat = mensaje.get("chat", {})
+    texto_original = mensaje.get("text") or ""
+    username_debug = mensaje.get("from", {}).get("username")
+    print(f"[Mensaje recibido] chat_type={chat.get('type')} de=@{username_debug} texto={texto_original!r}")
+
     if chat.get("type") != "private":
+        print("[Mensaje ignorado] no es un chat privado.")
         return  # el comando /estado solo funciona en el chat privado con el bot
 
-    texto = (mensaje.get("text") or "").strip().lower()
+    texto = texto_original.strip().lower()
     if not texto.startswith("/estado"):
+        print("[Mensaje ignorado] no empieza con /estado.")
         return
 
-    username = mensaje.get("from", {}).get("username")
-    responder_estado(username, chat["id"])
+    print(f"[Comando /estado] Procesando pedido de @{username_debug}...")
+    responder_estado(username_debug, chat["id"])
 
 
 # ==============================================================================
