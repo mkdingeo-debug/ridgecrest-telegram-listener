@@ -378,10 +378,10 @@ def procesar_mensaje(mensaje: dict) -> None:
     if texto_lower.startswith("/estado"):
         print(f"[Comando /estado] Procesando pedido de @{username_debug}...")
         responder_estado(username_debug, chat["id"], telegram_id)
-    elif texto_lower.startswith("/precios"):
+    elif texto_lower.startswith("/precios") or texto_lower.startswith("/precio"):
         print(f"[Comando /precios] Consulta de @{username_debug}.")
         enviar_mensaje(chat["id"], texto_precios())
-    elif texto_lower.startswith("/comprar"):
+    elif texto_lower.startswith("/compra"):
         print(f"[Comando /comprar] Pedido de @{username_debug}: {texto!r}")
         args = texto.split()[1:]
         nombre = mensaje.get("from", {}).get("first_name") or ""
