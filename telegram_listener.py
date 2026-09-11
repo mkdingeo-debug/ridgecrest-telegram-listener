@@ -60,6 +60,12 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").stri
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN_CANALES", "").strip()
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
+# Bot de avisos personales del usuario (el mismo que usa ridgecrest-pagos
+# para avisar pagos/vencimientos/latidos) — se usa acá solo para avisar
+# cuando entra un lead nuevo con /comprar.
+TELEGRAM_BOT_TOKEN_AVISOS = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID_AVISOS = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
 TERMINOS_URL = os.environ.get("TERMINOS_URL", "").strip()
 
 CHAT_ID_A_BOT = {
@@ -89,7 +95,9 @@ CANALES_VALIDOS = {
     "materias_primas": "incluye_materias_primas",
     "acciones": "incluye_acciones",
 }
-PRECIO_POR_PLAN = {"2": 15, "4": 30}
+# Precios por defecto, usados solo si todavía no se cargó nada en la tabla
+# configuracion_sistema (editable desde el backoffice, pestaña Negocio).
+PRECIO_POR_PLAN_DEFECTO = {"2": 15, "4": 30}
 DIRECCION_PAGO_USDT = os.environ.get("DIRECCION_PAGO_USDT", "").strip()
 RED_PAGO_USDT = os.environ.get("RED_PAGO_USDT", "TRC20").strip()
 
@@ -196,12 +204,57 @@ def crear_pago_pendiente(cliente_id: str, monto: float, hoy: str) -> None:
         raise RuntimeError(f"No se pudo crear el pago: {resp.status_code} {resp.text}")
 
 
+def obtener_precios_actuales() -> dict:
+    """Lee los precios configurados en configuracion_sistema (editable desde
+    el backoffice, pestaña Negocio). Si todavía no hay nada cargado ahí,
+    usa los valores por defecto (15/30 USDT), sin romper nada."""
+    precios = dict(PRECIO_POR_PLAN_DEFECTO)
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/configuracion_sistema",
+            params={"clave": "in.(precio_plan_2,precio_plan_4)", "select": "clave,valor"},
+            headers=_supabase_headers(), timeout=15,
+        )
+        resp.raise_for_status()
+        for fila in resp.json():
+            if fila["clave"] == "precio_plan_2":
+                precios["2"] = float(fila["valor"])
+            elif fila["clave"] == "precio_plan_4":
+                precios["4"] = float(fila["valor"])
+    except Exception as exc:
+        print(f"[Aviso] No se pudieron leer los precios configurados, uso los valores por defecto: {exc}")
+    return precios
+
+
+def avisar_lead_nuevo(nombre: str, username: str, etiqueta_plan: str, monto: float) -> None:
+    if not TELEGRAM_BOT_TOKEN_AVISOS or not TELEGRAM_CHAT_ID_AVISOS:
+        return
+    texto = (
+        f"🆕 Nuevo pedido registrado\n"
+        f"Cliente: @{username} ({nombre})\n"
+        f"Plan: {etiqueta_plan} — {monto:g} USDT\n\n"
+        f"Todavía no pagó — si tarda unos días, puede que le convenga que lo contactes."
+    )
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN_AVISOS}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID_AVISOS, "text": texto},
+            timeout=15,
+        )
+        resultado = resp.json()
+        if not resultado.get("ok"):
+            print(f"[Aviso] No se pudo avisar del lead nuevo: {resultado}")
+    except Exception as exc:
+        print(f"[Aviso] Error avisando del lead nuevo: {type(exc).__name__}: {exc}")
+
+
 def texto_precios() -> str:
+    precios = obtener_precios_actuales()
     lineas = [
         "📊 Planes de Ridgecrest:",
         "",
-        "• 2 canales a elección — 15 USDT/mes",
-        "• Los 4 canales (Cripto, Forex, Materias Primas, Acciones) — 30 USDT/mes",
+        f"• 2 canales a elección — {precios['2']:g} USDT/mes",
+        f"• Los 4 canales (Cripto, Forex, Materias Primas, Acciones) — {precios['4']:g} USDT/mes",
         "",
         "Para registrar tu pedido, escribime uno de estos:",
         "/comprar 4",
@@ -229,9 +282,10 @@ def procesar_comando_comprar(args: List[str], username: Optional[str], telegram_
         enviar_mensaje(chat_id, texto_precios())
         return
 
+    precios = obtener_precios_actuales()
     if len(args) == 1 and args[0] == "4":
         columnas = {c: True for c in CANALES_VALIDOS.values()}
-        monto = PRECIO_POR_PLAN["4"]
+        monto = precios["4"]
         etiqueta_plan = "los 4 canales"
     else:
         elegidos = [a.lower() for a in args if a.lower() in CANALES_VALIDOS]
@@ -243,7 +297,7 @@ def procesar_comando_comprar(args: List[str], username: Optional[str], telegram_
             )
             return
         columnas = {columna: (clave in elegidos) for clave, columna in CANALES_VALIDOS.items()}
-        monto = PRECIO_POR_PLAN["2"]
+        monto = precios["2"]
         etiqueta_plan = " y ".join(elegidos)
 
     try:
@@ -270,7 +324,8 @@ def procesar_comando_comprar(args: List[str], username: Optional[str], telegram_
         return
 
     print(f"[Comprar] Pedido registrado: @{username} -> {etiqueta_plan} ({monto} USDT).")
-    lineas = [f"✅ Registré tu pedido: {etiqueta_plan} — {monto} USDT/mes."]
+    avisar_lead_nuevo(cliente.get("nombre", nombre or username), username, etiqueta_plan, monto)
+    lineas = [f"✅ Registré tu pedido: {etiqueta_plan} — {monto:g} USDT/mes."]
     if DIRECCION_PAGO_USDT:
         lineas += ["", f"💰 Depositá en esta dirección (USDT, red {RED_PAGO_USDT}):", DIRECCION_PAGO_USDT]
     lineas += ["", "Una vez que hagas el depósito, el sistema lo va a detectar automáticamente y "
@@ -386,6 +441,21 @@ def procesar_mensaje(mensaje: dict) -> None:
         args = texto.split()[1:]
         nombre = mensaje.get("from", {}).get("first_name") or ""
         procesar_comando_comprar(args, username_debug, telegram_id, nombre, chat["id"])
+    elif texto_lower.startswith("/start"):
+        # Los links del tipo https://t.me/tu_bot?start=precios llegan acá
+        # como "/start precios" — así el link abre directo en el mensaje
+        # de precios, sin que la persona tenga que escribir nada.
+        partes = texto.split()
+        payload = partes[1].lower() if len(partes) > 1 else ""
+        print(f"[Comando /start] de @{username_debug}, payload={payload!r}")
+        if payload in ("precios", "precio", "comprar"):
+            enviar_mensaje(chat["id"], texto_precios())
+        else:
+            enviar_mensaje(
+                chat["id"],
+                "¡Hola! 👋 Escribime /precios para ver los planes disponibles, "
+                "o /estado si ya sos cliente y querés ver tu suscripción.",
+            )
     else:
         print("[Mensaje ignorado] no es un comando reconocido (/estado, /precios, /comprar).")
 
