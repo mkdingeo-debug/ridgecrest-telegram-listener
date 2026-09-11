@@ -47,7 +47,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from html import escape as escape_html
-from typing import Optional
+from typing import List, Optional
 
 import requests
 
@@ -76,6 +76,22 @@ BOT_A_COLUMNA = {
     "Materias Primas": "incluye_materias_primas",
     "Acciones": "incluye_acciones",
 }
+
+# ── Punto agregado a pedido del usuario: auto-atención de ventas ──────────
+# Comandos /precios y /comprar, para que un cliente nuevo pueda anotarse
+# solo, sin tener que escribirle antes al administrador. El administrador
+# sigue dando el visto bueno final ("Confirmar y renovar" en el
+# backoffice) — esto solo automatiza el registro del pedido y la entrega
+# de la dirección de depósito.
+CANALES_VALIDOS = {
+    "cripto": "incluye_cripto",
+    "forex": "incluye_forex",
+    "materias_primas": "incluye_materias_primas",
+    "acciones": "incluye_acciones",
+}
+PRECIO_POR_PLAN = {"2": 15, "4": 30}
+DIRECCION_PAGO_USDT = os.environ.get("DIRECCION_PAGO_USDT", "").strip()
+RED_PAGO_USDT = os.environ.get("RED_PAGO_USDT", "TRC20").strip()
 
 
 # ==============================================================================
@@ -114,6 +130,154 @@ def buscar_cliente_por_usuario(username: str) -> Optional[dict]:
     return None
 
 
+def guardar_telegram_id(cliente_id: str, telegram_id: int) -> None:
+    """Guarda el ID numérico de Telegram del cliente la primera vez que
+    interactúa con el bot (uniéndose a un canal, o usando /estado). Se
+    necesita este número (no alcanza con el @usuario) para poder sacarlo
+    de un canal más adelante si corresponde (punto 5.3)."""
+    url = f"{SUPABASE_URL}/rest/v1/clientes"
+    resp = requests.patch(
+        url,
+        params={"id": f"eq.{cliente_id}"},
+        json={"telegram_id": telegram_id},
+        headers=_supabase_headers(),
+        timeout=20,
+    )
+    if resp.status_code >= 300:
+        print(f"[Aviso] No se pudo guardar el telegram_id de {cliente_id}: {resp.status_code} {resp.text}")
+
+
+def crear_cliente(nombre: str, username: str, telegram_id: Optional[int]) -> dict:
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/clientes",
+        json={"nombre": nombre, "telegram_usuario": f"@{username}", "telegram_id": telegram_id},
+        headers={**_supabase_headers(), "Prefer": "return=representation"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json()[0]
+
+
+def crear_suscripcion_pendiente(cliente_id: str, columnas: dict, monto: float, hoy: str) -> None:
+    # Se crea con estado "cancelada" (no "activa") a propósito: es solo un
+    # borrador con el plan elegido, todavía no significa que el cliente
+    # tenga acceso. El administrador la activa de verdad al confirmar el
+    # pago desde el backoffice ("Confirmar y renovar").
+    payload = {
+        "cliente_id": cliente_id, "precio_usdt": monto,
+        "fecha_inicio": hoy, "fecha_vencimiento": hoy, "estado": "cancelada",
+        **columnas,
+    }
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/suscripciones", json=payload,
+        headers={**_supabase_headers(), "Prefer": "return=minimal"}, timeout=20,
+    )
+    if resp.status_code >= 300:
+        raise RuntimeError(f"No se pudo crear la suscripción: {resp.status_code} {resp.text}")
+
+
+def existe_pago_pendiente(cliente_id: str) -> bool:
+    resp = requests.get(
+        f"{SUPABASE_URL}/rest/v1/pagos",
+        params={"cliente_id": f"eq.{cliente_id}", "estado": "eq.pendiente", "select": "id"},
+        headers=_supabase_headers(), timeout=20,
+    )
+    resp.raise_for_status()
+    return len(resp.json()) > 0
+
+
+def crear_pago_pendiente(cliente_id: str, monto: float, hoy: str) -> None:
+    payload = {"cliente_id": cliente_id, "monto_usdt": monto, "fecha": hoy, "estado": "pendiente"}
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/pagos", json=payload,
+        headers={**_supabase_headers(), "Prefer": "return=minimal"}, timeout=20,
+    )
+    if resp.status_code >= 300:
+        raise RuntimeError(f"No se pudo crear el pago: {resp.status_code} {resp.text}")
+
+
+def texto_precios() -> str:
+    lineas = [
+        "📊 Planes de Ridgecrest:",
+        "",
+        "• 2 canales a elección — 15 USDT/mes",
+        "• Los 4 canales (Cripto, Forex, Materias Primas, Acciones) — 30 USDT/mes",
+        "",
+        "Para registrar tu pedido, escribime uno de estos:",
+        "/comprar 4",
+        "/comprar cripto forex",
+        "(opciones para 2 canales: cripto, forex, materias_primas, acciones)",
+    ]
+    if DIRECCION_PAGO_USDT:
+        lineas += ["", f"💰 Dirección de depósito (USDT, red {RED_PAGO_USDT}):", DIRECCION_PAGO_USDT]
+    lineas += ["", "Una vez que hagas el depósito, el sistema lo detecta automáticamente "
+                    "y el administrador te da acceso a la brevedad."]
+    return "\n".join(lineas)
+
+
+def procesar_comando_comprar(args: List[str], username: Optional[str], telegram_id: Optional[int],
+                              nombre: str, chat_id) -> None:
+    if not username:
+        enviar_mensaje(
+            chat_id,
+            "Necesito que tengas un @usuario configurado en Telegram para poder registrarte. "
+            "Configuralo en Ajustes de Telegram y volvé a intentar.",
+        )
+        return
+
+    if not args:
+        enviar_mensaje(chat_id, texto_precios())
+        return
+
+    if len(args) == 1 and args[0] == "4":
+        columnas = {c: True for c in CANALES_VALIDOS.values()}
+        monto = PRECIO_POR_PLAN["4"]
+        etiqueta_plan = "los 4 canales"
+    else:
+        elegidos = [a.lower() for a in args if a.lower() in CANALES_VALIDOS]
+        if len(elegidos) != 2:
+            enviar_mensaje(
+                chat_id,
+                "Para el plan de 2 canales, decime exactamente 2 (por ejemplo: /comprar cripto forex).\n\n"
+                + texto_precios(),
+            )
+            return
+        columnas = {columna: (clave in elegidos) for clave, columna in CANALES_VALIDOS.items()}
+        monto = PRECIO_POR_PLAN["2"]
+        etiqueta_plan = " y ".join(elegidos)
+
+    try:
+        cliente = buscar_cliente_por_usuario(username)
+        if not cliente:
+            cliente = crear_cliente(nombre or f"@{username}", username, telegram_id)
+        elif telegram_id and cliente.get("telegram_id") != telegram_id:
+            guardar_telegram_id(cliente["id"], telegram_id)
+
+        if existe_pago_pendiente(cliente["id"]):
+            enviar_mensaje(
+                chat_id,
+                "Ya tenés un pedido pendiente de confirmar. Hacé el depósito si todavía no lo hiciste, "
+                "y esperá a que el administrador te confirme el acceso.",
+            )
+            return
+
+        hoy = datetime.now(timezone.utc).date().isoformat()
+        crear_suscripcion_pendiente(cliente["id"], columnas, monto, hoy)
+        crear_pago_pendiente(cliente["id"], monto, hoy)
+    except Exception as exc:
+        print(f"[Error] No se pudo registrar el pedido de /comprar (@{username}): {type(exc).__name__}: {exc}")
+        enviar_mensaje(chat_id, "Hubo un problema registrando tu pedido. Probá de nuevo en un rato, o contactá al administrador.")
+        return
+
+    print(f"[Comprar] Pedido registrado: @{username} -> {etiqueta_plan} ({monto} USDT).")
+    lineas = [f"✅ Registré tu pedido: {etiqueta_plan} — {monto} USDT/mes."]
+    if DIRECCION_PAGO_USDT:
+        lineas += ["", f"💰 Depositá en esta dirección (USDT, red {RED_PAGO_USDT}):", DIRECCION_PAGO_USDT]
+    lineas += ["", "Una vez que hagas el depósito, el sistema lo va a detectar automáticamente y "
+                    "el administrador te va a dar acceso a la brevedad."]
+    enviar_mensaje(chat_id, "\n".join(lineas))
+
+
 # ==============================================================================
 # 2. TELEGRAM — helpers de envío
 # ==============================================================================
@@ -135,7 +299,7 @@ def enviar_mensaje(chat_id, texto: str, parse_mode: Optional[str] = None) -> Non
 # ==============================================================================
 # 3. PUNTO 6 — comando /estado
 # ==============================================================================
-def responder_estado(username: Optional[str], chat_id_respuesta) -> None:
+def responder_estado(username: Optional[str], chat_id_respuesta, telegram_id: Optional[int] = None) -> None:
     if not username:
         enviar_mensaje(
             chat_id_respuesta,
@@ -160,6 +324,9 @@ def responder_estado(username: Optional[str], chat_id_respuesta) -> None:
             "Si creés que es un error, contactá al administrador.",
         )
         return
+
+    if telegram_id and cliente.get("telegram_id") != telegram_id:
+        guardar_telegram_id(cliente["id"], telegram_id)
 
     suscripciones = cliente.get("suscripciones") or []
     if not suscripciones:
@@ -202,15 +369,25 @@ def procesar_mensaje(mensaje: dict) -> None:
 
     if chat.get("type") != "private":
         print("[Mensaje ignorado] no es un chat privado.")
-        return  # el comando /estado solo funciona en el chat privado con el bot
+        return  # estos comandos solo funcionan en el chat privado con el bot
 
-    texto = texto_original.strip().lower()
-    if not texto.startswith("/estado"):
-        print("[Mensaje ignorado] no empieza con /estado.")
-        return
+    texto = texto_original.strip()
+    texto_lower = texto.lower()
+    telegram_id = mensaje.get("from", {}).get("id")
 
-    print(f"[Comando /estado] Procesando pedido de @{username_debug}...")
-    responder_estado(username_debug, chat["id"])
+    if texto_lower.startswith("/estado"):
+        print(f"[Comando /estado] Procesando pedido de @{username_debug}...")
+        responder_estado(username_debug, chat["id"], telegram_id)
+    elif texto_lower.startswith("/precios"):
+        print(f"[Comando /precios] Consulta de @{username_debug}.")
+        enviar_mensaje(chat["id"], texto_precios())
+    elif texto_lower.startswith("/comprar"):
+        print(f"[Comando /comprar] Pedido de @{username_debug}: {texto!r}")
+        args = texto.split()[1:]
+        nombre = mensaje.get("from", {}).get("first_name") or ""
+        procesar_comando_comprar(args, username_debug, telegram_id, nombre, chat["id"])
+    else:
+        print("[Mensaje ignorado] no es un comando reconocido (/estado, /precios, /comprar).")
 
 
 # ==============================================================================
@@ -231,6 +408,17 @@ def procesar_chat_member(evento: dict) -> None:
     usuario = evento["new_chat_member"]["user"]
     nombre = usuario.get("first_name") or usuario.get("username") or "nuevo suscriptor"
     mencion = f'<a href="tg://user?id={usuario["id"]}">{escape_html(nombre)}</a>'
+
+    # Si el @usuario de quien se unió coincide con un cliente ya registrado,
+    # aprovechamos para guardar su ID numérico (lo vamos a necesitar más
+    # adelante si hace falta sacarlo del canal por falta de pago).
+    if usuario.get("username"):
+        try:
+            cliente = buscar_cliente_por_usuario(usuario["username"])
+            if cliente and cliente.get("telegram_id") != usuario["id"]:
+                guardar_telegram_id(cliente["id"], usuario["id"])
+        except Exception as exc:
+            print(f"[Aviso] No se pudo verificar/guardar telegram_id al unirse: {exc}")
 
     lineas = [
         f"👋 ¡Bienvenido/a {mencion}!",
